@@ -58,6 +58,10 @@ def parse_int_list(s):
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
+@click.option('--fold_path',     help='Training fold (json path)', metavar='FOLDPATH')
+@click.option('--fold_id',       help='Training fold id', type=int, metavar='FOLDID')
+@click.option('--fold_ticks',    help='Override fold_ticks', type=int, metavar='FOLDTICK')
+@click.option('--augpipe',        help='Where to save the results', type=str, metavar='AUGPIPE')
 
 # Performance-related.
 @click.option('--fp16',          help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=False, show_default=True)
@@ -94,7 +98,7 @@ def main(**kwargs):
 
     # Initialize config dict.
     c = dnnlib.EasyDict()
-    c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
+    c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache, fold_path=opts.fold_path, fold_id=opts.fold_id)
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
@@ -141,9 +145,21 @@ def main(**kwargs):
     if opts.cres is not None:
         c.network_kwargs.channel_mult = opts.cres
     if opts.augment:
+        ### TODO based on augpipe: generating with augpipe as input?
         c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', p=opts.augment)
-        c.augment_kwargs.update(xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
-        c.network_kwargs.augment_dim = 9
+        if opts.augpipe is None:
+            c.augment_kwargs.update(xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
+            c.network_kwargs.augment_dim = 9
+        elif opts.augpipe == 'blit':
+            ### 'blit':   dict(xflip=1, rotate90=1, xint=1),
+            c.augment_kwargs.update(xflip=1, rotate_int=1, translate_int=1)
+            c.network_kwargs.augment_dim = 5
+        elif opts.augpipe == 'bgc':
+            ### 'bgc':    dict(xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1),
+            c.augment_kwargs.update(xflip=1, rotate_int=1, translate_int=1, ### 5 dim
+                scale=1, rotate_frac=1, aniso=1, translate_frac=1, ### 7 dim
+                brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1) ### 6 dim
+            c.network_kwargs.augment_dim = 18
     c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16)
 
     # Training options.
@@ -175,10 +191,15 @@ def main(**kwargs):
         c.resume_kimg = int(match.group(1))
         c.resume_state_dump = opts.resume
 
+    ### Add fold_ticks option
+    c.fold_ticks = opts.fold_ticks
+
     # Description string.
     cond_str = 'cond' if c.dataset_kwargs.use_labels else 'uncond'
     dtype_str = 'fp16' if c.network_kwargs.use_fp16 else 'fp32'
     desc = f'{dataset_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
+    if c.fold_ticks is not None:
+        desc += f'foldticks{c.fold_ticks}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
 

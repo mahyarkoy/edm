@@ -14,6 +14,7 @@ import PIL.Image
 import json
 import torch
 import dnnlib
+import pickle as pk
 
 try:
     import pyspng
@@ -40,16 +41,24 @@ class Dataset(torch.utils.data.Dataset):
         self._cached_images = dict() # {raw_idx: np.ndarray, ...}
         self._raw_labels = None
         self._label_shape = None
+    
+        self.random_seed = random_seed
+        self.max_size = max_size
+        self._do_xflip = xflip
 
+        self.update_raw_idx(np.arange(self._raw_shape[0], dtype=np.int64))
+    
+    def update_raw_idx(self, val):
+        self._raw_idx = np.asarray(val)
+        
         # Apply max_size.
-        self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
-        if (max_size is not None) and (self._raw_idx.size > max_size):
-            np.random.RandomState(random_seed % (1 << 31)).shuffle(self._raw_idx)
-            self._raw_idx = np.sort(self._raw_idx[:max_size])
-
+        if (self.max_size is not None) and (self._raw_idx.size > self.max_size):
+            np.random.RandomState(self.random_seed % (1 << 31)).shuffle(self._raw_idx)
+            self._raw_idx = np.sort(self._raw_idx[:self.max_size])
+        
         # Apply xflip.
         self._xflip = np.zeros(self._raw_idx.size, dtype=np.uint8)
-        if xflip:
+        if self._do_xflip:
             self._raw_idx = np.tile(self._raw_idx, 2)
             self._xflip = np.concatenate([self._xflip, np.ones_like(self._xflip)])
 
@@ -168,6 +177,8 @@ class ImageFolderDataset(Dataset):
         path,                   # Path to directory or zip.
         resolution      = None, # Ensure specific resolution, None = highest available.
         use_pyspng      = True, # Use pyspng if available?
+        fold_path       = None, # Json path to read the fold_dict {fold: img_names}
+        fold_id         = None, # Key of the fold to use
         **super_kwargs,         # Additional arguments for the Dataset base class.
     ):
         self._path = path
@@ -193,6 +204,25 @@ class ImageFolderDataset(Dataset):
         if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
             raise IOError('Image files do not match the specified resolution')
         super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
+
+        ### Make folds
+        if fold_path is not None:
+            with open(fold_path, 'rb') as fs:
+                fold_dict = pk.load(fs)
+            
+            for fold, fold_names in fold_dict.items():
+                fold_dict[fold] = set(fold_names)
+            
+            self.folds = {fold: list() for fold in fold_dict}
+            for img_idx, img_name in enumerate(self._image_fnames):
+                for fold, fold_names in fold_dict.items():
+                    if img_name in fold_names:
+                        self.folds[fold].append(img_idx)
+            
+            if fold_id is not None:
+                self.update_raw_idx(self.folds[fold_id])
+        else:
+            self.folds = None
 
     @staticmethod
     def _file_ext(fname):

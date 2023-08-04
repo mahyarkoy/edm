@@ -19,6 +19,13 @@ import dnnlib
 from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
+import wandb
+
+import sys
+sys.path.insert(1, 'libs/')
+from manifmetric.manifmetric import ManifoldMetric
+from manifmetric.nets import EDM
+from manifmetric.dataset import block_draw
 
 #----------------------------------------------------------------------------
 
@@ -46,6 +53,7 @@ def training_loop(
     resume_kimg         = 0,        # Start from the given training progress.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
+    fold_ticks              = None,     # Intervals at which to update dataset fold.
 ):
     # Initialize.
     start_time = time.time()
@@ -75,6 +83,18 @@ def training_loop(
     net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
     net.train().requires_grad_(True).to(device)
     if dist.get_rank() == 0:
+        ### Init wandb and tensorboard
+        # ---------------------------------------- #
+        wandb.init(project='creative_metric_gms', name=run_dir, dir=run_dir, 
+            config=dict(batch_size=batch_size, fold_ticks=fold_ticks, training_set_kwargs=dataset_kwargs, data_loader_kwargs=data_loader_kwargs, network_kwargs=network_kwargs, loss_kwargs=loss_kwargs, optimizer_kwargs=optimizer_kwargs, augment_kwargs=augment_kwargs), resume='allow', sync_tensorboard=True)
+        
+        try:
+            import torch.utils.tensorboard as tensorboard
+            stats_tfevents = tensorboard.SummaryWriter(run_dir)
+        except ImportError as err:
+            print('Skipping tfevents export:', err)
+        # ---------------------------------------- #
+
         with torch.no_grad():
             images = torch.zeros([batch_gpu, net.img_channels, net.img_resolution, net.img_resolution], device=device)
             sigma = torch.ones([batch_gpu], device=device)
@@ -109,6 +129,7 @@ def training_loop(
         del data # conserve memory
 
     # Train.
+    inception_metric, vgg_metric = None, None
     dist.print0(f'Training for {total_kimg} kimg...')
     dist.print0()
     cur_nimg = resume_kimg * 1000
@@ -118,7 +139,24 @@ def training_loop(
     maintenance_time = tick_start_time - start_time
     dist.update_progress(cur_nimg // 1000, total_kimg)
     stats_jsonl = None
+    pre_fold = -1
     while True:
+
+        ### Setup training data for folds
+        # ---------------------------------------- #
+        if fold_ticks is not None and fold_ticks > 0 and (new_fold := min(cur_tick // fold_ticks, len(dataset_obj.folds)-1)) != pre_fold:
+            pre_fold = new_fold
+            dataset_obj.update_raw_idx(dataset_obj.folds[new_fold])
+            dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed+new_fold)
+            dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
+            if dist.get_rank() == 0:
+                print()
+                print(f'Fold {new_fold}')
+                print('Fold Num images: ', len(dataset_obj))
+                print('Fold Image shape: ', dataset_obj.image_shape)
+                print('Fold Label shape: ', dataset_obj.label_shape)
+                print()
+        # ---------------------------------------- #
 
         # Accumulate gradients.
         optimizer.zero_grad(set_to_none=True)
@@ -191,6 +229,132 @@ def training_loop(
         # Save full dump of the training state.
         if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
             torch.save(dict(net=net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
+
+        ### VALIDATION METRICS EVALUATION
+        # ---------------------------------------- #
+        def val_transform(data):
+            img = data[0] if isinstance(data, (tuple, list)) else data
+            img = torch.as_tensor(img, dtype=torch.float32) / 255
+            if img.shape[1] == 1:
+                img = img.repeat([1, 3, 1, 1])
+            return img
+        
+        def model_transform(data):
+            img = data[0] if isinstance(data, (tuple, list)) else data
+            if img.shape[1] == 1:
+                img = img.repeat([1, 3, 1, 1])
+            return img
+        
+        def is_distributed():
+            return torch.distributed.is_initialized()
+        
+        num_gpus = dist.get_world_size()
+        rank = dist.get_rank()
+        if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
+            if rank == 0:
+                print(f'Validation metrics...')
+            
+            if vgg_metric is None or inception_metric is None:
+                ### Setup validation set
+                head, _ = os.path.split(os.path.normpath(dataset_kwargs['path']))
+                validation_path = os.path.join(head, 'test')
+                assert os.path.exists(validation_path), f'Path does not exist: {validation_path}'
+                validation_set_kwargs = dict(dataset_kwargs, path=validation_path, fold_path=None, fold_id=None, xflip=False, use_labels=False, max_size=None)
+                validation_set = dnnlib.util.construct_class_by_name(**validation_set_kwargs) # subclass of training.dataset.Dataset
+                validation_split_len = int(np.ceil(len(validation_set) / num_gpus))
+                validation_sampler = torch.arange(len(validation_set))[rank*validation_split_len:(rank+1)*validation_split_len]
+                validation_loader = torch.utils.data.DataLoader(dataset=validation_set, sampler=validation_sampler, batch_size=batch_gpu, **data_loader_kwargs)
+                if rank == 0:
+                    print(f'\n>>> Read validation data from {validation_path}')
+                    print('Val Num images: ', len(validation_set))
+                    print('Val Image shape: ', validation_set.image_shape)
+                    print('Val Label shape: ', validation_set.label_shape)
+                    print()
+
+                ### Collect validation features
+                vgg_metric = ManifoldMetric(model='vgg16')
+                feats = vgg_metric.extract_features(validation_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=val_transform)
+                if is_distributed():
+                    torch.distributed.reduce(feats, dst=0, op=torch.distributed.ReduceOp.SUM)
+                if rank == 0:
+                    vgg_metric.compute_ref_stats(feats, k=5)
+                
+                inception_metric = ManifoldMetric(model='inceptionv3')
+                feats = inception_metric.extract_features(validation_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=val_transform)
+                if is_distributed():
+                    torch.distributed.reduce(feats, dst=0, op=torch.distributed.ReduceOp.SUM)
+                if rank == 0:
+                    inception_metric.compute_ref_stats(feats)
+            
+            ### Collect model features
+            model_loader = EDM(model=ema).get_iter(size=len(validation_sampler), batch_size=batch_gpu)
+            feats = vgg_metric.extract_features(model_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=model_transform)
+            if is_distributed():
+                torch.distributed.reduce(feats, dst=0, op=torch.distributed.ReduceOp.SUM)
+            if rank == 0:
+                val_metrics = dict()
+                vgg_metric.compute_gen_stats(feats, k=5)
+                val_metrics['prec'] = vgg_metric.precision()
+                val_metrics['comp_prec'] = vgg_metric.comp_precision()
+                val_metrics['recall'] = vgg_metric.recall()
+                val_metrics['density'] = vgg_metric.density()
+                val_metrics['coverage'] = vgg_metric.coverage()
+            ### Conserve memory
+            del feats
+            vgg_metric.gen_stats = None
+
+            feats = inception_metric.extract_features(model_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=model_transform)
+            if is_distributed():
+                torch.distributed.reduce(feats, dst=0, op=torch.distributed.ReduceOp.SUM)
+            if rank == 0:
+                inception_metric.compute_gen_stats(feats)
+                val_metrics['fid'] = inception_metric.fid()
+                val_metrics['kid'] = inception_metric.kid()
+            ### Conserve memory
+            del feats
+            inception_metric.gen_stats = None
+
+            ### Save val metrics
+            if rank == 0:
+                global_step = int(cur_nimg / 1e3)
+                jsonl = json.dumps(dict(val_metrics, nimg=cur_nimg, tick=cur_tick, step=global_step))
+                with open(os.path.join(run_dir, 'val_metrics.jsonl'), 'at') as fs:
+                    fs.write(jsonl + '\n')
+                    fs.flush()
+                if stats_tfevents is not None:
+                    for metric_name, metric_val in val_metrics.items():
+                        stats_tfevents.add_scalar(f'val_metrics/{metric_name}', metric_val, global_step=global_step)
+        
+        ### Draw real samples
+        draw_num_samples = 64
+        if rank == 1:
+            draw_reals = list()
+            num_reals = 0
+            for data in validation_loader:
+                draw_reals.append(val_transform(data))
+                num_reals += draw_reals[-1].shape[0]
+                if num_reals >= draw_num_samples:
+                    break
+            block_draw(torch.concat(draw_reals).permute(0, 2, 3, 1),
+                path=os.path.join(run_dir, 'val_reals.png'), border=True)
+            del draw_reals
+        
+        ### Draw fake samples
+        draw_per_gpu = int(np.ceil(draw_num_samples // num_gpus))
+        draw_model_loader = EDM(model=ema).get_iter(size=draw_per_gpu, batch_size=batch_gpu)
+        draw_gens = list()
+        for data in draw_model_loader:
+            draw_gens.append(model_transform(data))
+        draw_gens = torch.concat(draw_gens)
+        draw_gather_list = [torch.zeros_like(draw_gens)]*num_gpus
+        dist.gather(draw_gens, gather_list=draw_gather_list, dst=0)
+        if rank == 1:
+            block_draw(torch.concat(draw_gather_list).permute(0, 2, 3, 1)[:draw_num_samples],
+                path=os.path.join(run_dir, 'val_gens.png'), border=True)
+        del draw_gens
+        del draw_gather_list
+
+        # ---------------------------------------- #
 
         # Update logs.
         training_stats.default_collector.update()

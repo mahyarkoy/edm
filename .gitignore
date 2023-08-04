@@ -1,0 +1,8 @@
+__pycache__/
+.cache/
+.vscode/
+.DS_Store
+libs/
+logs/
+test*
+data/
