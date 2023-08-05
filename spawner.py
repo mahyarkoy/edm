@@ -24,7 +24,7 @@ echo "CPU allocated: "$(taskset -c -p $$)
 echo "GPU allocated: "$CUDA_VISIBLE_DEVICES
 nvidia-smi
 source /nas/home/mkhayat/.bashrc
-conda activate stylegan2ada
+conda activate py38edm
 export TORCH_EXTENSIONS_DIR={save_dir}
 '''
 
@@ -49,7 +49,7 @@ echo "CPU allocated: "$(taskset -c -p $$)
 echo "GPU allocated: "$CUDA_VISIBLE_DEVICES
 nvidia-smi
 source /nas/home/mkhayat/.bashrc
-conda activate stylegan2ada
+conda activate py38edm
 '''
 
 COPY_STR = 'cp -r {temp_dir} {save_dir}'
@@ -58,8 +58,8 @@ DEL_STR = 'rm -r {temp_dir}'
 EXP_CONFIGS = {
     'cifar_separate':
     {
-        'cmd': 'python train.py',
-        'outdir': 'cifar_fold{fold_id}_foldticks{fold_ticks}_seeddata{seed}',
+        'cmd': 'torchrun --standalone --nproc_per_node=2 train.py',
+        'outdir': 'cifar_{augpipe}_fold{fold_id}_foldticks{fold_ticks}_seeddata{seed}',
         'cond': 0,
         'xflip': 0,
         'data': 'data/cifar/train',
@@ -69,16 +69,17 @@ EXP_CONFIGS = {
         'duration': 25, ### MImgs
         'tick': 4,
         'snap': 25000 // (4*50),
-        'gpus': 2,
+        'dump': 10 * 25000 // (4*50),
         'seed': 1000,
         'cache': 1,
-        'augpipe': 'blit', #bgc,
-        'workers': 4
+        'workers': 4,
+        'batch-gpu': 64,
+        'augpipe': 'blit' #bgc
     },
     
-    'cifar_separate':
+    'cifar_test':
     {
-        'cmd': 'python train.py',
+        'cmd': 'torchrun --standalone --nproc_per_node=2 train.py',
         'outdir': 'te_cifar_fold{fold_id}_foldticks{fold_ticks}_seeddata{seed}',
         'cond': 0,
         'xflip': 0,
@@ -89,11 +90,12 @@ EXP_CONFIGS = {
         'duration': 0.01, ### MImgs
         'tick': 4,
         'snap': 10 // (4*2),
-        'gpus': 2,
+        'dump': 2 * 10 // (4*2),
         'seed': 1000,
         'cache': 1,
-        'augpipe': 'blit', #bgc,
-        'workers': 4
+        'workers': 4,
+        'batch-gpu': 64,
+        'augpipe': 'bgc' #bgc
     },
 }
 

@@ -273,14 +273,14 @@ def training_loop(
 
                 ### Collect validation features
                 vgg_metric = ManifoldMetric(model='vgg16')
-                feats = vgg_metric.extract_features(validation_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=val_transform)
+                feats = vgg_metric.extract_features(validation_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=val_transform, verbose=rank==0)
                 if is_distributed():
                     torch.distributed.reduce(feats, dst=0, op=torch.distributed.ReduceOp.SUM)
                 if rank == 0:
                     vgg_metric.compute_ref_stats(feats, k=5)
                 
                 inception_metric = ManifoldMetric(model='inceptionv3')
-                feats = inception_metric.extract_features(validation_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=val_transform)
+                feats = inception_metric.extract_features(validation_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=val_transform, verbose=rank==0)
                 if is_distributed():
                     torch.distributed.reduce(feats, dst=0, op=torch.distributed.ReduceOp.SUM)
                 if rank == 0:
@@ -288,7 +288,7 @@ def training_loop(
             
             ### Collect model features
             model_loader = EDM(model=ema).get_iter(size=len(validation_sampler), batch_size=batch_gpu)
-            feats = vgg_metric.extract_features(model_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=model_transform)
+            feats = vgg_metric.extract_features(model_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=model_transform, verbose=rank==0)
             if is_distributed():
                 torch.distributed.reduce(feats, dst=0, op=torch.distributed.ReduceOp.SUM)
             if rank == 0:
@@ -303,7 +303,7 @@ def training_loop(
             del feats
             vgg_metric.gen_stats = None
 
-            feats = inception_metric.extract_features(model_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=model_transform)
+            feats = inception_metric.extract_features(model_loader, device=device, output_shape=len(validation_set), output_ids=validation_sampler, transform=model_transform, verbose=rank==0)
             if is_distributed():
                 torch.distributed.reduce(feats, dst=0, op=torch.distributed.ReduceOp.SUM)
             if rank == 0:
@@ -327,7 +327,7 @@ def training_loop(
         
         ### Draw real samples
         draw_num_samples = 64
-        if rank == 1:
+        if rank == 0:
             draw_reals = list()
             num_reals = 0
             for data in validation_loader:
@@ -335,7 +335,7 @@ def training_loop(
                 num_reals += draw_reals[-1].shape[0]
                 if num_reals >= draw_num_samples:
                     break
-            block_draw(torch.concat(draw_reals).permute(0, 2, 3, 1),
+            block_draw(torch.concat(draw_reals).permute(0, 2, 3, 1).cpu().numpy(),
                 path=os.path.join(run_dir, 'val_reals.png'), border=True)
             del draw_reals
         
@@ -345,14 +345,15 @@ def training_loop(
         draw_gens = list()
         for data in draw_model_loader:
             draw_gens.append(model_transform(data))
-        draw_gens = torch.concat(draw_gens)
-        draw_gather_list = [torch.zeros_like(draw_gens)]*num_gpus
-        dist.gather(draw_gens, gather_list=draw_gather_list, dst=0)
-        if rank == 1:
-            block_draw(torch.concat(draw_gather_list).permute(0, 2, 3, 1)[:draw_num_samples],
-                path=os.path.join(run_dir, 'val_gens.png'), border=True)
+        if is_distributed():
+            draw_gens = torch.concat(draw_gens)
+            gather_list = [torch.zeros_like(draw_gens)]*num_gpus if rank==0 else None
+            torch.distributed.gather(draw_gens, gather_list=gather_list, dst=0)
+            draw_gens = gather_list
+        if rank == 0:
+            block_draw(torch.concat(draw_gens).permute(0, 2, 3, 1).cpu().numpy()[:draw_num_samples],
+                path=os.path.join(run_dir, f'val_gens_{cur_nimg//1000}.png'), border=True)
         del draw_gens
-        del draw_gather_list
 
         # ---------------------------------------- #
 
