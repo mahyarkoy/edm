@@ -325,35 +325,35 @@ def training_loop(
                     for metric_name, metric_val in val_metrics.items():
                         stats_tfevents.add_scalar(f'val_metrics/{metric_name}', metric_val, global_step=global_step)
         
-        ### Draw real samples
-        draw_num_samples = 64
-        if rank == 0:
-            draw_reals = list()
-            num_reals = 0
-            for data in validation_loader:
-                draw_reals.append(val_transform(data))
-                num_reals += draw_reals[-1].shape[0]
-                if num_reals >= draw_num_samples:
-                    break
-            block_draw(torch.concat(draw_reals).permute(0, 2, 3, 1).cpu().numpy(),
-                path=os.path.join(run_dir, 'val_reals.png'), border=True)
-            del draw_reals
-        
-        ### Draw fake samples
-        draw_per_gpu = int(np.ceil(draw_num_samples // num_gpus))
-        draw_model_loader = EDM(model=ema).get_iter(size=draw_per_gpu, batch_size=batch_gpu)
-        draw_gens = list()
-        for data in draw_model_loader:
-            draw_gens.append(model_transform(data))
-        if is_distributed():
-            draw_gens = torch.concat(draw_gens)
-            gather_list = [torch.zeros_like(draw_gens)]*num_gpus if rank==0 else None
-            torch.distributed.gather(draw_gens, gather_list=gather_list, dst=0)
-            draw_gens = gather_list
-        if rank == 0:
-            block_draw(torch.concat(draw_gens).permute(0, 2, 3, 1).cpu().numpy()[:draw_num_samples],
-                path=os.path.join(run_dir, f'val_gens_{cur_nimg//1000}.png'), border=True)
-        del draw_gens
+            ### Draw real samples
+            draw_num_samples = 64
+            if rank == 0:
+                draw_reals = list()
+                num_reals = 0
+                for data in validation_loader:
+                    draw_reals.append(val_transform(data))
+                    num_reals += draw_reals[-1].shape[0]
+                    if num_reals >= draw_num_samples:
+                        break
+                block_draw(torch.concat(draw_reals).permute(0, 2, 3, 1).cpu().numpy(),
+                    path=os.path.join(run_dir, 'val_reals.png'), border=True)
+                del draw_reals
+            
+            ### Draw fake samples
+            draw_per_gpu = int(np.ceil(draw_num_samples // num_gpus))
+            draw_model_loader = EDM(model=ema).get_iter(size=draw_per_gpu, batch_size=batch_gpu)
+            draw_gens = list()
+            for data in draw_model_loader:
+                draw_gens.append(model_transform(data))
+            if is_distributed():
+                draw_gens = torch.concat(draw_gens)
+                gather_list = [torch.zeros_like(draw_gens)]*num_gpus if rank==0 else None
+                torch.distributed.gather(draw_gens, gather_list=gather_list, dst=0)
+                draw_gens = gather_list
+            if rank == 0:
+                block_draw(torch.concat(draw_gens).permute(0, 2, 3, 1).cpu().numpy()[:draw_num_samples],
+                    path=os.path.join(run_dir, f'val_gens_{cur_nimg//1000}.png'), border=True)
+            del draw_gens
 
         # ---------------------------------------- #
 

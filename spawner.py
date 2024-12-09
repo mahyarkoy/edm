@@ -9,9 +9,9 @@ SBATCH_STR = '''#!/bin/bash
 #SBATCH --account=gard 
 #SBATCH --qos=premium 
 #SBATCH --partition=ALL 
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:{device} 
-#SBATCH --mem=32G
+#SBATCH --mem=64G
 #SBATCH --time=5-00:00:00
 #SBATCH --output={save_dir}/sbatch_{job_name}.out
 #SBATCH --error={save_dir}/sbatch_{job_name}.out
@@ -34,9 +34,9 @@ SBATCH_STR_LARGE = '''#!/bin/bash
 #SBATCH --account=gard 
 #SBATCH --qos=premium_memory
 #SBATCH --partition=large_gpu
-#SBATCH --cpus-per-task=16 
+#SBATCH --cpus-per-task=8 
 #SBATCH --gres=gpu:{device}
-#SBATCH --mem=128G
+#SBATCH --mem=64G
 #SBATCH --time=5-00:00:00
 #SBATCH --output={save_dir}/sbatch_{job_name}.out
 #SBATCH --error={save_dir}/sbatch_{job_name}.out
@@ -50,6 +50,7 @@ echo "GPU allocated: "$CUDA_VISIBLE_DEVICES
 nvidia-smi
 source /nas/home/mkhayat/.bashrc
 conda activate py38edm
+ulimit -n 50000
 '''
 
 COPY_STR = 'cp -r {temp_dir} {save_dir}'
@@ -64,7 +65,7 @@ EXP_CONFIGS = {
         'xflip': 0,
         'data': 'data/cifar/train',
         'fold_path': 'data/cifar/train/folds_10eq_seed{seed}.pk',
-        'fold_id': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        'fold_id': [6],#[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
         'fold_ticks': 0,
         'duration': 25, ### MImgs
         'tick': 4,
@@ -73,24 +74,25 @@ EXP_CONFIGS = {
         'seed': 1000,
         'cache': 1,
         'workers': 4,
-        'batch-gpu': 64,
+        'batch-gpu': 256,
+        # 'resume': '/nas/home/mkhayat/projects/edm/logs/edm/cifar/cifar_blit_fold5_foldticks0_seeddata1000/00000-train-uncond-ddpmpp-edm-gpus2-batch512-fp32foldticks0/training-state-010240.pt',
         'augpipe': 'blit' #bgc
     },
     
     'cifar_test':
     {
-        'cmd': 'torchrun --standalone --nproc_per_node=2 train.py',
+        'cmd': 'torchrun --standalone --nproc_per_node=1 train.py',
         'outdir': 'te_cifar_fold{fold_id}_foldticks{fold_ticks}_seeddata{seed}',
         'cond': 0,
         'xflip': 0,
         'data': 'data/cifar/train',
         'fold_path': 'data/cifar/train/folds_10eq_seed{seed}.pk',
-        'fold_id': 7,
+        'fold_id': [0, 1, 2, 3, 4],
         'fold_ticks': 0,
-        'duration': 0.01, ### MImgs
+        # 'duration': 0.01, ### MImgs
         'tick': 4,
-        'snap': 10 // (4*2),
-        'dump': 2 * 10 // (4*2),
+        # 'snap': 10 // (4*2),
+        # 'dump': 2 * 10 // (4*2),
         'seed': 1000,
         'cache': 1,
         'workers': 4,
